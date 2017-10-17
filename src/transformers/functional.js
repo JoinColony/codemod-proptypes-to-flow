@@ -1,9 +1,41 @@
 import propTypeToFlowType from '../helpers/propTypeToFlowType';
 
-function removeComponentAssignmentPropTypes(ast, j) {
-  const componentToPropTypesRemoved = {};
+export default function transformFunctionalComponents(root, j) {
+  const meta = getMeta(root, j);
+  replacePropTypes(root, j, meta);
+  insertTypeAnnotation(root, j, meta);
+  removeImport(root, j);
+  return true;
+}
 
-  ast
+function insertTypeAnnotation(root, j, { componentName }) {
+  const declaration = root.find(j.VariableDeclarator, { id: { name: componentName }});
+  const typeAnnotation = j.typeAnnotation(j.genericTypeAnnotation(j.identifier('Props'), null));
+  const functionExpression = declaration.find(j.ArrowFunctionExpression);
+  functionExpression.find(j.ObjectPattern).forEach(objectSpread => {
+    objectSpread.value.typeAnnotation = typeAnnotation;
+  });
+}
+
+function replacePropTypes(root, j, { componentName, propTypes, propTypesDeclaration }) {
+  const flowTypes = getFlowTypes(propTypes, j);
+  if (propTypesDeclaration) {
+    propTypesDeclaration.forEach(f => f.parent.insertBefore(flowTypes));
+	propTypesDeclaration.remove();
+  } else {
+    const declaration = root.find(j.VariableDeclarator, { id: { name: componentName }});
+    declaration.forEach(f => f.parent.insertBefore(flowTypes));
+  }
+}
+
+function removeImport (root, j) {
+  root.find(j.ImportSpecifier, {
+    local: { name: 'PropTypes' }
+  }).remove();
+}
+
+function getMeta(root, j) {
+  const assignment = root
     .find(j.AssignmentExpression, {
       left: {
         property: {
@@ -11,105 +43,38 @@ function removeComponentAssignmentPropTypes(ast, j) {
         },
       },
     })
-    .forEach(p => {
-      const objectName = p.value.left.object.name;
-      const properties = p.value.right.properties;
-      const flowTypesRemoved = properties.map(property => {
-        const t = propTypeToFlowType(j, property.key, property.value);
-        t.comments = property.comments;
-        return t;
-      });
-
-      componentToPropTypesRemoved[objectName] = flowTypesRemoved;
-    })
-    .remove();
-
-  return componentToPropTypesRemoved;
-}
-
-function insertTypeIdentifierInFunction(functionPath, j, typeIdentifier) {
-  const functionRoot = functionPath.value.init || functionPath.value;
-
-  const params = functionRoot.params;
-  const param = params[0];
-
-  const newTypeAnnotation = j.typeAnnotation(
-    j.genericTypeAnnotation(j.identifier(typeIdentifier), null)
-  );
-
-  if (param.type === 'Identifier') {
-    param.typeAnnotation = newTypeAnnotation;
-  } else if (param.type === 'ObjectPattern') {
-    // NOTE: something is wrong with recast and objectPatterns...
-    // You cannot set typeAnnotation on them, do object spread instead
-
-    const newProps = j.identifier('props');
-    newProps.typeAnnotation = newTypeAnnotation;
-    functionRoot.params = [newProps];
-    const newSpread = j.variableDeclaration('const', [
-      j.variableDeclarator(param, j.identifier('props')),
-    ]);
-
-    // if the body of the function is an expression, we need to construct
-    // a block statement to hold the props spread
-    if (functionRoot.body.type === 'BlockStatement') {
-      functionRoot.body.body.unshift(newSpread);
-    } else {
-      const returnExpression = j.returnStatement(functionRoot.body);
-      functionRoot.body = j.blockStatement([newSpread, returnExpression]);
-    }
+  const assignmentNode = assignment.nodes()[0];
+  let propTypes;
+  let propTypesDeclaration;
+  if (assignmentNode.right.type === 'ObjectExpression') {
+     propTypes = assignmentNode.right.properties;
+  } else {
+    const propTypesVarName = assignmentNode.right.name;
+    propTypesDeclaration = root.find(j.VariableDeclarator, { id: { name: propTypesVarName }});
+    const node = propTypesDeclaration.nodes()[0];
+    propTypes = node.init.properties;
+  }
+  const componentName = assignmentNode.left.object.name;
+  assignment.remove();
+  return {
+    propTypesDeclaration,
+    propTypes,
+    componentName,
   }
 }
 
-/**
- * Transforms function components
- * @return true if any functional components were transformed.
- */
-export default function transformFunctionalComponents(ast, j) {
-  // Look for Foo.propTypes
-  const componentToPropTypesRemoved = removeComponentAssignmentPropTypes(
-    ast,
-    j
-  );
-  const components = Object.keys(componentToPropTypesRemoved);
-
-  if (components.length === 0) {
-    return null;
-  }
-
-  components.forEach(c => {
-    const flowTypesRemoved = componentToPropTypesRemoved[c];
-    const propIdentifier = components.length === 1 ? 'Props' : `${c}Props`;
-    const flowTypeProps = j.exportNamedDeclaration(
+function getFlowTypes(properties, j) {
+  const flowTypesRemoved = properties.map(property => {
+    const t = propTypeToFlowType(j, property.key, property.value);
+    t.comments = property.comments;
+    return t;
+  });
+  const flowTypeProps = j.exportNamedDeclaration(
       j.typeAlias(
-        j.identifier(propIdentifier),
+        j.identifier('Props'),
         null,
         j.objectTypeAnnotation(flowTypesRemoved)
       )
     );
-
-    ast
-      .find(j.FunctionDeclaration, {
-        id: { name: c },
-      })
-      .forEach(f => {
-        const insertNode = f.parent.node.type === 'Program' ? f : f.parent;
-        insertNode.insertBefore(flowTypeProps);
-        insertTypeIdentifierInFunction(f, j, propIdentifier);
-      });
-
-    ast
-      .find(j.VariableDeclarator, {
-        id: { name: c },
-      })
-      .forEach(f => {
-        const insertNode = f.parent.parent.node.type === 'Program'
-          ? f.parent
-          : f.parent.parent;
-        insertNode.insertBefore(flowTypeProps);
-        insertTypeIdentifierInFunction(f, j, propIdentifier);
-      });
-  });
-
-  return components.length > 0;
+  return flowTypeProps;
 }

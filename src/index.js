@@ -25,10 +25,15 @@ export default function transformer(file, api) {
     return file.source;
   }
 
-  const classModifications = transformEs6ClassComponents(root, j);
-  const functionalModifications = transformFunctionalComponents(root, j);
+  let modifications;
 
-  if (classModifications || functionalModifications) {
+  if (root.find(j.ClassDeclaration).length) {
+    modifications = transformEs6ClassComponents(root, j);
+  } else {
+    modifications = transformFunctionalComponents(root, j);
+  }
+
+  if (modifications) {
     addFlowComment(j, root);
     return root.toSource({ quote: 'single', trailingComma: true });
   } else {

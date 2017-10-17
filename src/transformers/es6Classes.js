@@ -1,131 +1,70 @@
-import annotateConstructor from '../helpers/annotateConstructor';
-import createTypeAlias from '../helpers/createTypeAlias';
-import findIndex from '../helpers/findIndex';
-import findParentBody from '../helpers/findParentBody';
-import transformProperties from '../helpers/transformProperties';
-import ReactUtils from '../helpers/ReactUtils';
+import propTypeToFlowType from '../helpers/propTypeToFlowType';
 
-const isStaticPropType = p => {
-  return (
-    p.type === 'ClassProperty' &&
-    p.static &&
-    p.key.type === 'Identifier' &&
-    p.key.name === 'propTypes'
-  );
-};
-
-function containsFlowProps(classBody) {
-  return !!classBody.find(bodyElement =>
-    bodyElement.key.name.toLowerCase().includes('props')
-  );
+export default function transformEs6ClassComponents(root, j) {
+  const meta = getMeta(root, j);
+  replacePropTypes(root, j, meta);
+  insertTypeAnnotation(root, j, meta);
+  removeImport(root, j);
+  return true;
 }
 
-/**
- * Transforms es2016 components
- * @return true if any components were transformed.
- */
-export default function transformEs6Classes(ast, j) {
-  const reactUtils = ReactUtils(j);
+function insertTypeAnnotation(root, j, { componentName }) {
+  const genericAnnotation = j.genericTypeAnnotation(j.identifier('Props'), null);
+  const superTypeAnnotation = j.typeParameterInstantiation([genericAnnotation]);
+  const declaration = root.find(j.ClassDeclaration);
+  const constructor = root.find(j.MethodDefinition, { key: { name: 'constructor' }}).find(j.FunctionExpression);
+  if (constructor.length) {
+    constructor.forEach(p => {
+      p.value.params[0].typeAnnotation = j.typeAnnotation(genericAnnotation);
+    });
+  }
+  declaration.forEach(p => p.value.superTypeParameters = superTypeAnnotation);
+}
 
-  const classNamesWithPropsOutside = [];
+function replacePropTypes(root, j, { componentName, propTypes, propTypesDeclaration }) {
+  const flowTypes = getFlowTypes(propTypes, j);
+  const declaration = root.find(j.ClassDeclaration);
+  declaration.insertBefore(flowTypes);
+}
 
-  // NOTE: reactUtils.findReactES6ClassDeclaration(ast) is missing extends
-  // for local imported components... If finding all classes is too greety,
-  // we might combine findReactES6ClassDeclaration with classes that have a
-  // render method.
-  const reactClassPaths = ast.find(j.ClassDeclaration);
+function removeImport (root, j) {
+  root.find(j.ImportSpecifier, {
+    local: { name: 'PropTypes' }
+  }).remove();
+}
 
-  // find classes with propType static class property
-  const modifications = reactClassPaths
-    .forEach(p => {
-      const className = reactUtils.getComponentName(p);
-      const propIdentifier = reactClassPaths.length === 1
-        ? 'Props'
-        : `${className}Props`;
-      let properties;
-
-      const classBody = p.value.body && p.value.body.body;
-      if (classBody) {
-        if (containsFlowProps(classBody)) {
-          return;
-        }
-
-        annotateConstructor(j, classBody, propIdentifier);
-        const index = findIndex(classBody, isStaticPropType);
-        if (typeof index !== 'undefined') {
-          const classProperty = classBody.splice(index, 1).pop();
-          properties = classProperty.value.properties;
-        } else {
-          // look for propTypes defined elsewhere
-          classNamesWithPropsOutside.push(className);
-
-          ast
-            .find(j.AssignmentExpression, {
-              left: {
-                type: 'MemberExpression',
-                object: {
-                  name: className,
-                },
-                property: {
-                  name: 'propTypes',
-                },
-              },
-              right: {
-                type: 'ObjectExpression',
-              },
-            })
-            .forEach(p => {
-              // this should only be one?
-              properties = p.value.right.properties;
-            })
-            .remove();
-        }
-
-        properties = properties || [];
-        const typeAlias = createTypeAlias(
-          j,
-          transformProperties(j, properties),
-          {
-            name: propIdentifier,
-            shouldExport: true,
-          }
-        );
-
-        // Find location to put propTypes flowtype definition
-        // This will place ahead of class def
-        const { child, body } = findParentBody(p);
-        if (body && child) {
-          const bodyIndex = findIndex(body.value, b => b === child);
-          if (bodyIndex) {
-            body.value.splice(bodyIndex, 0, typeAlias);
-          }
-        }
-      }
-    })
-    .size();
-
-  ast
-    .find(j.ExpressionStatement, {
-      expression: {
-        type: 'AssignmentExpression',
-        left: {
-          type: 'MemberExpression',
-          property: {
-            name: 'propTypes',
-          },
-        },
-        right: {
-          type: 'ObjectExpression',
-        },
+function getMeta(root, j) {
+  const staticPropTypes = root
+    .find(j.ClassProperty, {
+      key: {
+        name: 'propTypes',
       },
     })
-    .filter(
-      p =>
-        classNamesWithPropsOutside.indexOf(
-          p.value.expression.left.object.name
-        ) > -1
-    )
-    .remove();
+  const assignmentNode = staticPropTypes.nodes()[0];
+  const propTypes = assignmentNode.value.properties;
+  const propTypesDeclaration = staticPropTypes;
+  staticPropTypes.remove();
+  const declaration = root.find(j.ClassDeclaration);
+  const componentName = declaration.nodes()[0].id.name;
+  return {
+    propTypesDeclaration,
+    propTypes,
+    componentName,
+  }
+}
 
-  return modifications > 0;
+function getFlowTypes(properties, j) {
+  const flowTypesRemoved = properties.map(property => {
+    const t = propTypeToFlowType(j, property.key, property.value);
+    t.comments = property.comments;
+    return t;
+  });
+  const flowTypeProps = j.exportNamedDeclaration(
+      j.typeAlias(
+        j.identifier('Props'),
+        null,
+        j.objectTypeAnnotation(flowTypesRemoved)
+      )
+    );
+  return flowTypeProps;
 }
